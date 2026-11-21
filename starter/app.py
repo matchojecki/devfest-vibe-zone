@@ -1,4 +1,4 @@
-"""Deliberately slow, correct SQLite baseline. See README before optimizing."""
+"""Optimized, correct SQLite API. WAL mode, synchronous FULL, unique index, single-query feed aggregation."""
 import os
 import re
 import sqlite3
@@ -17,19 +17,23 @@ NAME = re.compile(r"[a-zA-Z0-9_]{1,32}\Z")
 
 with sqlite3.connect(DB_PATH) as db:
     db.executescript("""
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = FULL;
         CREATE TABLE IF NOT EXISTS posts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             author TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS likes (post_id INTEGER NOT NULL, user TEXT NOT NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_likes_post_user ON likes(post_id, user);
     """)
 
 
 def connection():
     if "db" not in g:
-        # Intentionally: one connection per request, DELETE journal, FULL sync.
         g.db = sqlite3.connect(DB_PATH, timeout=10)
         g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode = WAL")
+        g.db.execute("PRAGMA synchronous = FULL")
     return g.db
 
 
@@ -75,7 +79,6 @@ def create_post():
         raise ValueError("author must match [a-zA-Z0-9_]{1,32}")
     if not isinstance(content, str) or not 1 <= len(content) <= 280 or not content.strip():
         raise ValueError("content must contain 1..280 characters and not be blank")
-    # Keep supplied content verbatim; trim only tests for whitespace-only input.
     try:
         content.encode("utf-8")
     except UnicodeEncodeError:
@@ -95,7 +98,6 @@ def like():
     if type(post_id) is not int or post_id < 1 or post_id > 9223372036854775807 or not valid_name(user):
         raise ValueError("Expected a positive integer post_id and a valid user")
     db = connection()
-    # Serialize the check + insert without adding an index. Correct even if workers change.
     with db:
         db.execute("BEGIN IMMEDIATE")
         if db.execute("SELECT id FROM posts WHERE id = ?", (post_id,)).fetchone() is None:
@@ -109,12 +111,14 @@ def like():
 @app.get("/feed")
 def feed():
     db = connection()
-    # One read transaction makes all 21 queries a consistent snapshot.
     with db:
         db.execute("BEGIN")
-        posts = []
-        for row in db.execute("SELECT * FROM posts ORDER BY id DESC LIMIT 20").fetchall():
-            post = dict(row)
-            post["likes"] = db.execute("SELECT COUNT(*) FROM likes WHERE post_id = ?", (row["id"],)).fetchone()[0]
-            posts.append(post)
+        query = """
+            SELECT p.id, p.author, p.content, p.created_at, COUNT(l.post_id) AS likes
+            FROM (SELECT id, author, content, created_at FROM posts ORDER BY id DESC LIMIT 20) p
+            LEFT JOIN likes l ON p.id = l.post_id
+            GROUP BY p.id
+            ORDER BY p.id DESC
+        """
+        posts = [dict(row) for row in db.execute(query).fetchall()]
     return jsonify(posts=posts)
