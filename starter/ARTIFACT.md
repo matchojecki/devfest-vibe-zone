@@ -1,24 +1,20 @@
-# Tested size-optimised Rust runtime
+# Lean Rust runtime artifact
 
-Default Dockerfile assembles the exact tested static linux/amd64 executable without network access or compilation. Full application source and Cargo.lock are retained.
+Default Dockerfile packages the exact tested static linux/amd64 executable without network or compilation. Full source and lockfile retained.
 
-Application source remains byte-identical to commit ef3ccc088c32ba1e871a5eb6e6b6f9ede1d50a0a. Changes are build settings only: Rust opt-level z, fat LTO, SQLite native size optimisation and removal of unused SQLite extensions. SQLite WAL and synchronous=FULL remain unchanged and asserted at startup. Thread-safety and API armour retained.
+Replaces Axum with direct Hyper HTTP/1, one current-thread Tokio network executor and a dedicated SQLite writer. SQLite optional modules pruned for size; SQLite WAL synchronous=FULL remains asserted on the application connection. SQL COMMIT precedes feed publication and acknowledgement. No benchmark-specific behaviour.
 
-Binary SHA256: f8b2d785ca4b5086a8186927a5efe7c5ccb8cf8000fae3e79efb46d1cf977cea
-Tested runtime image: sha256:27424170fdbcb14fbda4dca47dd4c9a45cbd3297182bf046fc3e7c341dc492cf
-Verified uncompressed layer TAR bytes: 1612800.
+Binary SHA256: 8c4b7c7f4bbaab9bd2e4c368081828f311eac73ba0e7efc02146f8090bed73de
+Application SHA256: 53ec851199df2a4485ce6d2a892a9593f80889bd62c15152d3878479b07f57ef
+Tested scratch image: sha256:dcacb1bb5a820b5cf7d9bf0d06c551e53aa481ebfe0be2c4314f1a1bf50ea9bb
+Verified uncompressed layer TAR bytes: 1464832.
 
-Validation: archive validator and Docker load passed; 145 API checks passed, measured feed identical after SIGKILL/restart, then 6 restart checks passed. Local runc checks, not official runsc execution. No latency/capacity measurement was performed for this exact build before publication. No speedup claim.
+Validation: archive validator and Docker load; 145 API checks, SIGKILL/restart feed equality and 6 restart checks passed. Extra HTTP/Unicode/chunked/pipelining and 1000 persistent connection regressions passed. Short 500VU diagnostic: candidate/control p99 both12ms, zero errors; not proof of speedup or official capacity. Generator2CPU, SUT1CPU2GiB, runc rather than official runsc. No sustained reliability claim for this build.
 
-Build runtime:
+Build exact submitted package:
 ```
-docker build --network=none -t devfest-rust:runtime starter
+docker build --network=none -t devfest-lean:runtime starter
 ```
+Dockerfile.source and Dockerfile.source.tested preserve the actually exercised source-build configuration. They require the provisioned local devfest-rust:builder image with compiler/dependencies, not a publicly available base. Default submission builds FROM scratch and needs no such builder. Source remains fully auditable; no claim of clean-environment source reproduction without provisioning that base.
 
-Source build in a sufficiently provisioned environment:
-```
-docker build -f starter/Dockerfile.source -t devfest-rust:source starter
-```
-Dockerfile.source uses the pinned upstream toolchain. Dockerfile.source.tested records the actually exercised source build using the existing provisioned devfest-rust:builder image and offline locked dependencies. The portable source build was not independently exercised. Default submission packaging uses the tested binary, not the source-build path.
-
-Nonroot UID10001, read-only compatible root, persistent /data, same entrypoint and API behaviour. Earlier image and release remain preserved in Git history. Organiser approval and official measurement are separate gates.
+Nonroot10001:10001, persistent /data, read-only root compatible. Previous releases preserved in Git history. Official approval/import/measurement remain separate gates.

@@ -1,19 +1,17 @@
-FROM rust:1-alpine@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS build
-RUN apk add --no-cache musl-dev gcc
-WORKDIR /build
-ENV CARGO_BUILD_JOBS=1 CFLAGS=-Os
-ENV LIBSQLITE3_FLAGS="-USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_JSON1 -USQLITE_SOUNDEX -USQLITE_ENABLE_COLUMN_METADATA -USQLITE_ENABLE_LOAD_EXTENSION -USQLITE_ENABLE_MEMORY_MANAGEMENT -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_JSON"
+FROM devfest-rust:builder AS build
+WORKDIR /lean
+ENV CARGO_BUILD_JOBS=2
+# Keep SQLite's generated SQL grammar intact. Disable optional extension modules.
+# WAL, FULL synchronous, transactions, indexes, uniqueness and recovery remain enabled.
+ENV CFLAGS="-Os -ffunction-sections -fdata-sections -USQLITE_ENABLE_FTS3 -USQLITE_ENABLE_FTS3_PARENTHESIS -USQLITE_ENABLE_FTS5 -USQLITE_ENABLE_RTREE -USQLITE_ENABLE_DBSTAT_VTAB -USQLITE_ENABLE_STAT4 -USQLITE_ENABLE_MEMORY_MANAGEMENT -USQLITE_SOUNDEX -DSQLITE_OMIT_JSON -DSQLITE_OMIT_UTF16 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_DEPRECATED -DSQLITE_OMIT_TRACE -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_AUTHORIZATION -DSQLITE_OMIT_COMPILEOPTION_DIAGS -DSQLITE_OMIT_COMPLETE -DSQLITE_OMIT_INCRBLOB -DSQLITE_DEFAULT_MEMSTATUS=0"
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-RUN --mount=type=cache,target=/build/target --mount=type=cache,target=/usr/local/cargo/registry \
-    cargo build --release --locked && mkdir -p /runtime/data && chown 10001:10001 /runtime/data \
-    && cp target/release/devfest-rust /runtime/devfest-rust
-
+RUN --mount=type=cache,id=lean-small-target,target=/lean/target --mount=type=cache,target=/usr/local/cargo/registry cargo build --release --locked && mkdir -p /runtime/data && chown 10001:10001 /runtime/data && cp target/release/devfest-lean /runtime/devfest-lean
 FROM scratch
-COPY --from=build /runtime/devfest-rust /devfest-rust
+COPY --from=build /runtime/devfest-lean /devfest-lean
 COPY --from=build --chown=10001:10001 /runtime/data /data
 ENV PORT=8080 DATA_DIR=/data
 USER 10001:10001
 VOLUME ["/data"]
 EXPOSE 8080
-ENTRYPOINT ["/devfest-rust"]
+ENTRYPOINT ["/devfest-lean"]

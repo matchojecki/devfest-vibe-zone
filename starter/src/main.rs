@@ -1,10 +1,14 @@
 use arc_swap::ArcSwap;
-use axum::{body::{to_bytes, Body, Bytes}, extract::{Request, State}, http::{Method, header}, response::Response, Router};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper::{body::Incoming, Request, Response, Method, header};
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use chrono::{Utc, SecondsFormat};
 use rusqlite::{Connection, params, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::{collections::{VecDeque, HashMap}, env, sync::Arc};
+use std::{collections::{VecDeque, HashMap}, env, sync::Arc, convert::Infallible};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Clone, Serialize)]
@@ -15,19 +19,17 @@ enum Operation { Post(String, String), Like(i64, String), Health }
 struct Shared { writer: mpsc::Sender<Command>, feed: Arc<ArcSwap<Bytes>> }
 fn encoded(v: impl Serialize) -> Bytes { Bytes::from(serde_json::to_vec(&v).expect("JSON serialization")) }
 fn error(status: u16, msg: &str) -> Reply { (status, encoded(json!({"error": msg}))) }
-fn response(r: Reply, head: bool) -> Response {
+fn response(r: Reply, head: bool) -> Response<Full<Bytes>> {
     let len = r.1.len();
     Response::builder().status(r.0).header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, len).body(if head { Body::empty() } else { Body::from(r.1) }).unwrap()
+        .header(header::CONTENT_LENGTH, len).body(Full::new(if head { Bytes::new() } else { r.1 })).unwrap()
 }
 fn name(v: Option<&Value>) -> Option<String> {
     let s = v?.as_str()?;
     if (1..=32).contains(&s.len()) && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') { Some(s.to_owned()) } else { None }
 }
 type Input = HashMap<String, Box<serde_json::value::RawValue>>;
-fn field(value: &Input, key: &str) -> Option<Value> {
-    serde_json::from_str(value.get(key)?.get()).ok()
-}
+fn field(value: &Input, key: &str) -> Option<Value> { serde_json::from_str(value.get(key)?.get()).ok() }
 fn feed_bytes(posts: &VecDeque<Post>) -> Bytes { encoded(json!({"posts":posts})) }
 fn initial(db: &Connection) -> rusqlite::Result<VecDeque<Post>> {
     let mut stmt = db.prepare("SELECT p.id,p.author,p.content,p.created_at,(SELECT COUNT(*) FROM likes l WHERE l.post_id=p.id) FROM posts p ORDER BY p.id DESC LIMIT 20")?;
@@ -39,7 +41,7 @@ fn write_post(db: &mut Connection, author: String, content: String) -> rusqlite:
     let tx = db.transaction()?;
     tx.prepare_cached("INSERT INTO posts(author,content,created_at) VALUES(?,?,?)")?.execute(params![author,content,created_at])?;
     let id = tx.last_insert_rowid();
-    tx.commit()?; // FULL WAL sync is complete before any cache publication or reply.
+    tx.commit()?;
     Ok(Post{id,author,content,created_at,likes:0})
 }
 fn write_like(db: &mut Connection, id: i64, user: String) -> rusqlite::Result<Option<i64>> {
@@ -72,9 +74,8 @@ fn writer(mut db: Connection, mut posts: VecDeque<Post>, snapshot: Arc<ArcSwap<B
             })
         };
         let reply = result.unwrap_or_else(|e| { eprintln!("database operation failed: {e}"); error(500,"Internal Server Error") });
-        // Snapshot publication follows COMMIT and precedes acknowledgment. One writer
-        // serializes DB state, snapshot generations, and responses without group commit.
-        let _ = cmd.reply.send(reply); // Disconnected client does not undo committed data.
+        // SQL COMMIT succeeds before snapshot publication and acknowledgment.
+        let _ = cmd.reply.send(reply);
     }
 }
 async fn dispatch(state: &Shared, op: Operation) -> Reply {
@@ -82,7 +83,7 @@ async fn dispatch(state: &Shared, op: Operation) -> Reply {
     if state.writer.send(Command{op,reply}).await.is_err() { return error(500,"Internal Server Error"); }
     rx.await.unwrap_or_else(|_| error(500,"Internal Server Error"))
 }
-async fn handle(State(state): State<Arc<Shared>>, req: Request) -> Response {
+async fn handle(state: Arc<Shared>, req: Request<Incoming>) -> Response<Full<Bytes>> {
     let method = req.method().clone();
     let head = method == Method::HEAD;
     let path = percent_encoding::percent_decode_str(req.uri().path()).decode_utf8_lossy();
@@ -90,7 +91,7 @@ async fn handle(State(state): State<Arc<Shared>>, req: Request) -> Response {
     let write = matches!(path.as_ref(), "/posts" | "/like");
     if !read && !write { return response(error(404,"The requested URL was not found on the server. If you entered the URL manually please check your spelling and try again."), head); }
     let allow = if read { "GET, HEAD, OPTIONS" } else { "POST, OPTIONS" };
-    if method == Method::OPTIONS { return Response::builder().status(200).header(header::ALLOW,allow).header(header::CONTENT_TYPE,"text/html; charset=utf-8").header(header::CONTENT_LENGTH,0).body(Body::empty()).unwrap(); }
+    if method == Method::OPTIONS { return Response::builder().status(200).header(header::ALLOW,allow).header(header::CONTENT_TYPE,"text/html; charset=utf-8").header(header::CONTENT_LENGTH,0).body(Full::new(Bytes::new())).unwrap(); }
     if !(read && (method == Method::GET || head) || write && method == Method::POST) {
         return response(error(405,"The method is not allowed for the requested URL."),head);
     }
@@ -98,16 +99,14 @@ async fn handle(State(state): State<Arc<Shared>>, req: Request) -> Response {
     if path == "/health" { return response(dispatch(&state,Operation::Health).await,head); }
     let like = path == "/like";
     let mime = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    if !(mime == "application/json" || (mime.starts_with("application/") && mime.ends_with("+json"))) {
-        return response(error(400,"Expected a JSON object"), false);
-    }
-    let bytes = match to_bytes(req.into_body(),16384).await { Ok(v)=>v, Err(_)=>return response(error(400,"The data value transmitted exceeds the capacity limit."),false) };
-    // Decode used fields only; preserve the semantics of ignored extra keys.
+    if !(mime == "application/json" || (mime.starts_with("application/") && mime.ends_with("+json"))) { return response(error(400,"Expected a JSON object"), false); }
+    let bytes = match Limited::new(req.into_body(),16384).collect().await {
+        Ok(v)=>v.to_bytes(), Err(_)=>return response(error(400,"The data value transmitted exceeds the capacity limit."),false)
+    };
     let input = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
     let value: Input = match serde_json::from_slice(input) { Ok(v)=>v, _=>return response(error(400,"Expected a JSON object"),false) };
     let op = if like {
-        let post_id = field(&value,"post_id");
-        let user = field(&value,"user");
+        let post_id = field(&value,"post_id"); let user = field(&value,"user");
         match (post_id.as_ref().and_then(Value::as_i64).filter(|id| *id>0),name(user.as_ref())) {
             (Some(id),Some(user))=>Operation::Like(id,user),
             _=>return response(error(400,"Expected a positive integer post_id and a valid user"),false)
@@ -116,9 +115,7 @@ async fn handle(State(state): State<Arc<Shared>>, req: Request) -> Response {
         let author_value=field(&value,"author");
         let author=match name(author_value.as_ref()) { Some(v)=>v, None=>return response(error(400,"author must match [a-zA-Z0-9_]{1,32}"),false) };
         let content_value=field(&value,"content");
-        if content_value.is_none() && value.get("content").is_some_and(|raw| raw.get().starts_with('"')) {
-            return response(error(400,"content must be valid UTF-8"),false);
-        }
+        if content_value.is_none() && value.get("content").is_some_and(|raw| raw.get().starts_with('"')) { return response(error(400,"content must be valid UTF-8"),false); }
         let content=match content_value.as_ref().and_then(Value::as_str) {
             Some(v) if (1..=280).contains(&v.chars().count()) && v.chars().any(|c| !(c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)))=>v.to_owned(),
             _=>return response(error(400,"content must contain 1..280 characters and not be blank"),false)
@@ -127,7 +124,7 @@ async fn handle(State(state): State<Arc<Shared>>, req: Request) -> Response {
     };
     response(dispatch(&state,op).await,false)
 }
-#[tokio::main(flavor="multi_thread", worker_threads=2)]
+#[tokio::main(flavor="current_thread")]
 async fn main() {
     let dir=env::var("DATA_DIR").unwrap_or_else(|_|"/data".into());
     std::fs::create_dir_all(&dir).expect("create DATA_DIR");
@@ -137,7 +134,7 @@ async fn main() {
     let mode:String=db.pragma_query_value(None,"journal_mode",|r|r.get(0)).unwrap();
     let sync:i64=db.pragma_query_value(None,"synchronous",|r|r.get(0)).unwrap();
     assert_eq!(mode,"wal"); assert_eq!(sync,2);
-    eprintln!("SQLite journal_mode={mode} synchronous={sync} writer=single commit=per-operation");
+    eprintln!("SQLite journal_mode={mode} synchronous={sync} writer=single commit=per-operation runtime=current_thread http=hyper1");
     let posts=initial(&db).expect("load committed feed");
     let feed=Arc::new(ArcSwap::from_pointee(feed_bytes(&posts)));
     let (tx,rx)=mpsc::channel(4096);
@@ -146,5 +143,17 @@ async fn main() {
     let state=Arc::new(Shared{writer:tx,feed});
     let port=env::var("PORT").unwrap_or_else(|_|"8080".into());
     let listener=tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.expect("listen");
-    axum::serve(listener,Router::new().fallback(handle).with_state(state)).await.expect("serve");
+    loop {
+        let (stream,_)=listener.accept().await.expect("accept");
+        let state=state.clone();
+        tokio::spawn(async move {
+            let service=service_fn(move |req| {
+                let state=state.clone();
+                async move { Ok::<_,Infallible>(handle(state,req).await) }
+            });
+            // Hyper supplies framing, chunked decoding, keepalive, pipelining and HEAD semantics.
+            let _=hyper::server::conn::http1::Builder::new().max_buf_size(32768)
+                .serve_connection(TokioIo::new(stream),service).await;
+        });
+    }
 }
